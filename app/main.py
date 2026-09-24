@@ -21,6 +21,16 @@ validation: a dry run only reports the planned created/updated rows, while
 a real commit upserts every row in one serialised transaction (updates
 keep ``exposure_count``) and leaves the bank untouched if any row fails.
 
+``GET /api/items/{id}/analysis`` reviews a single item's quality from
+history: only responses stored by *finished* sessions count, scored by the
+immutable per-response ``score`` (later edits to an item's answer key never
+rewrite history).  For every finished session that answered the target
+item and at least one other item, the target score and the correct ratio
+of the remaining items form one sample; the endpoint reports the valid
+sample size, the item's correct rate and the Pearson correlation between
+the two series (``null`` below 5 samples or when either series has no
+variance).  The endpoint is read-only.
+
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
 cannot be lost to read/write races.
@@ -42,12 +52,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from . import irt
+from . import analysis, irt
 from .database import get_db, init_db
 from .importer import NormalizedItem, RowError, validate_rows
 from .models import (
     BankItemOut,
     HealthOut,
+    ItemAnalysisOut,
     ItemBankOut,
     ItemDetailOut,
     ItemImportErrorOut,
@@ -436,6 +447,46 @@ def get_item(
     base = serialize_bank_item(row).model_dump()
     base["options"] = parse_options(row["options"])
     return ItemDetailOut(**base)
+
+
+@app.get(
+    "/api/items/{item_id}/analysis",
+    response_model=ItemAnalysisOut,
+    tags=["items"],
+    summary="单题质量复盘（已结束会话历史作答、正确率与 Pearson 相关，只读）",
+)
+def get_item_analysis(
+    item_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ItemAnalysisOut:
+    """Review one item's quality from finished-session history.
+
+    Only responses stored by ``finished`` sessions count, and scoring uses
+    the immutable per-response ``score`` written at answer time, so a later
+    edit of the item's answer key (e.g. via bulk import) never rewrites
+    history.  Each finished session that answered the target item *and* at
+    least one other item contributes one sample: the target item's score
+    (0/1) paired with the correct ratio of the session's remaining items.
+
+    The response carries the valid sample size, the item's correct rate
+    across those samples and the Pearson correlation between the two
+    series.  The correlation is ``null`` when fewer than
+    ``analysis.MIN_SAMPLES`` (5) samples exist or either series has zero
+    variance; the correct rate is ``null`` when there are no samples at
+    all.  Unknown items are rejected with 404.  The endpoint is read-only:
+    it never touches sessions, exposure counts or the item bank.
+    """
+    row = conn.execute(
+        "SELECT id FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    result = analysis.analyze_item(conn, item_id)
+    return ItemAnalysisOut(
+        item_id=result.item_id,
+        sample_size=result.sample_size,
+        correct_rate=result.correct_rate,
+        pearson_r=result.pearson_r,
+    )
 
 
 # -------------------------------------------------------------------------

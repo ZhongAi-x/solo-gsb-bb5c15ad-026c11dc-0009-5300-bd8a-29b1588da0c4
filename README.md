@@ -12,6 +12,7 @@
 - 支持可选**能力估计精度停测** `target_se` + `min_precision_items`：每次作答更新 θ 后，在当前 θ 处重算本场全部已答题的 2PL Fisher 信息总和，`SE = 1/√Σ信息`；已答数达到下限、`SE ≤ target_se` 且标签配额均已满足时，在同一事务内结束会话（`finish_reason = precision_reached`）；
 - 提供会话进度查询与完整答题记录查询，会话状态/进度/取题响应均返回当前标准误 `standard_error` 与停测配置；
 - 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count`），任一错误整批不变；
+- 提供**单题质量复盘** `GET /api/items/{item_id}/analysis`：只统计**已结束会话**的历史作答，对错以作答时保存的 `score` 为准（题目事后改答案不影响结果）；对每个「答过目标题且至少另答一题」的会话，以目标题得分与同场其余题答对比例组成样本，返回有效样本数、正确率及两者的 Pearson 相关系数（样本 <5 或任一序列无方差时为 `null`）；接口只读，不改变会话、曝光与题库；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -19,8 +20,9 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 单题复盘
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
+│   ├── analysis.py    # 题目质量分析：已结束会话采样、正确率、Pearson 相关系数
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── database.py    # SQLite 连接、建表、初始化
 │   ├── models.py      # Pydantic 请求/响应模型
@@ -261,6 +263,37 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
   有错误的正式提交返回 HTTP `422` 且 `valid=false`、计数为 0；
   预检即使有错误也是 HTTP `200`，便于把预检集成进上传 UI。
 
+### 单题质量复盘（`GET /api/items/{item_id}/analysis`）
+
+用历史作答复盘一道题的表现，常用于题目质量分析（区分度是否合理、是否过难/过易）：
+
+- **只统计已结束会话**（`status = finished`）的作答记录；进行中或暂停中的会话不计入，
+  避免未完成的答题轨迹污染统计。
+- **对错以作答时保存的 `responses.score` 为准**：该分数在提交答案的瞬间写入且不可变，
+  题目事后被批量导入修改答案（`items.answer` 更新）不会改写历史结论。
+- **样本构造**：对每个「答过目标题且至少另答一题」的已结束会话取一个样本点 —
+  `x` 为该场目标题得分（0/1），`y` 为该场**其余题**的答对比例（其余题得分之和 / 其余题数）。
+- 返回字段：
+  - `sample_size`：有效样本数（满足上述条件的会话数）；
+  - `correct_rate`：目标题在有效样本中的正确率（`x` 的均值）；无有效样本时为 `null`；
+  - `pearson_r`：`x` 与 `y` 的 **Pearson 相关系数**（点二列相关的连续化形式，
+    正值说明答对该题的考生在同场其余题上表现也更好）。**有效样本少于 5，
+    或任一序列无方差**（目标题全对/全错、或各场其余题答对比例完全相同）时为 `null`。
+- 未知题目返回 `404`；接口**只读**，不改变会话状态、曝光计数与题库内容。
+
+```bash
+# 先启动服务（Docker Compose 单条命令，API 监听 8000 端口）：
+docker compose up --build
+
+# 复盘 ITEM-001（http://localhost:8000 为本地地址）
+curl -s http://localhost:8000/api/items/ITEM-001/analysis
+# {"item_id":"ITEM-001","sample_size":12,"correct_rate":0.5833,
+#  "pearson_r":0.6412}
+# 样本不足或序列无方差时：
+# {"item_id":"ITEM-002","sample_size":3,"correct_rate":0.6667,"pearson_r":null}
+# 未知题目 -> HTTP 404 {"detail":"item not found"}
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -268,6 +301,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/health` | 健康检查、题库题量 |
 | GET  | `/api/items` | 题库列表（含曝光次数，分页 `limit/offset`） |
 | GET  | `/api/items/{item_id}` | 单题详情（管理用，含正确答案） |
+| GET  | `/api/items/{item_id}/analysis` | **单题质量复盘**（已结束会话样本、正确率、Pearson 相关，只读） |
 | POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数） |
 | POST | `/api/sessions` | 创建测验会话 |
 | GET  | `/api/sessions/{id}` | 会话状态 |
@@ -415,6 +449,11 @@ curl -s http://localhost:8000/api/sessions/$SID/progress
 # "target_se" / "min_precision_items"（停测配置）和
 # "standard_error"（当前 θ 处 1/√ΣFisher 信息；无已答题为 null）
 curl -s http://localhost:8000/api/sessions/$SID/responses
+
+# 7) 单题质量复盘（只读；只统计已结束会话的历史作答）
+curl -s http://localhost:8000/api/items/ITEM-001/analysis
+# {"item_id":"ITEM-001","sample_size":6,"correct_rate":0.5,"pearson_r":0.7276}
+# 有效样本 <5 或任一序列无方差时 pearson_r 为 null；未知题目返回 404
 ```
 
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从

@@ -52,6 +52,27 @@ class ItemBankOut(BaseModel):
     items: list[BankItemOut]
 
 
+class ItemAnalysisOut(BaseModel):
+    """单题质量复盘：只统计已结束会话的历史作答（只读）。"""
+
+    item_id: str
+    sample_size: int = Field(
+        ...,
+        description="有效样本数：已结束、答过目标题且至少另答一题的会话数",
+    )
+    correct_rate: float | None = Field(
+        ...,
+        description="目标题在有效样本中的正确率（按作答时保存的 score 统计）；无有效样本时为 null",
+    )
+    pearson_r: float | None = Field(
+        ...,
+        description=(
+            "目标题得分与同场其余题答对比例的 Pearson 相关系数；"
+            "有效样本少于 5 或任一序列无方差时为 null"
+        ),
+    )
+
+
 # ---- item bulk import ------------------------------------------------------
 
 class ItemImportRequest(BaseModel):
