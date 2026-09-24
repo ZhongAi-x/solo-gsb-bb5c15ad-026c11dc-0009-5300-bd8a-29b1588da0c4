@@ -12,6 +12,7 @@
 - 支持可选**能力估计精度停测** `target_se` + `min_precision_items`：每次作答更新 θ 后，在当前 θ 处重算本场全部已答题的 2PL Fisher 信息总和，`SE = 1/√Σ信息`；已答数达到下限、`SE ≤ target_se` 且标签配额均已满足时，在同一事务内结束会话（`finish_reason = precision_reached`）；
 - 提供会话进度查询与完整答题记录查询，会话状态/进度/取题响应均返回当前标准误 `standard_error` 与停测配置；
 - 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count`），任一错误整批不变；
+- 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -21,6 +22,7 @@
 ├── app/
 │   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
+│   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── database.py    # SQLite 连接、建表、初始化
 │   ├── models.py      # Pydantic 请求/响应模型
@@ -35,11 +37,21 @@
 
 ### 方式一：Docker Compose（推荐）
 
+单条命令即可构建镜像并在后台启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+前台运行（直接看日志，`Ctrl+C` 停止）可用：
+
 ```bash
 docker compose up --build
 ```
 
-- API： http://localhost:8000
+启动后服务监听 **8000** 端口：
+
+- API 根地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
 - SQLite 数据持久化在命名卷 `quiz-data`（容器内 `/data/quiz.db`）
@@ -261,6 +273,38 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
   有错误的正式提交返回 HTTP `422` 且 `valid=false`、计数为 0；
   预检即使有错误也是 HTTP `200`，便于把预检集成进上传 UI。
 
+### 单题质量复盘（`GET /api/items/{id}/analysis`）
+
+只读地复盘单道题在历史测验中的表现，用于发现偏易/偏难或区分度异常的题目：
+
+- **样本来源**：仅统计状态为 `finished` 的**已结束会话**；进行中/暂停中的会话不计入。
+  每个会话必须**答过目标题且同场至少另答一题**，否则不成样本。
+- **样本构成**：每个有效会话贡献一对数值：
+  - `x` = 该会话在目标题上的得分（`responses.score`，1 对 / 0 错）；
+  - `y` = 同场**其余**已答题的答对比例（其余题得分之和 / 其余题题数），可看作该考生本场整体水平的代理。
+- **使用作答时保存的 `score`**：复盘只读历史 `responses` 记录，**不**按题库当前答案重新判分；
+  之后通过批量导入修改该题答案，不会改变历史复盘结果。
+- **返回字段**：
+  - `sample_count`：有效样本数；
+  - `correct_rate`：目标题在有效样本中的历史正确率（无样本时为 `null`）；
+  - `pearson_correlation`：`x` 与 `y` 的 Pearson 相关系数——正值表示目标题答得好的考生
+    同场其他题也答得好（区分方向正常）。**样本少于 5 个，或任一序列无方差
+    （如所有样本目标题都答对）时相关系数未定义，返回 `null`。**
+- 接口完全只读：不创建/结束会话、不改变曝光计数、不写题库。
+- 未知题目返回 **HTTP 404**。
+
+```jsonc
+// GET /api/items/ITEM-001/analysis
+{
+  "item_id": "ITEM-001",
+  "sample_count": 12,
+  "correct_rate": 0.6666666666666666,
+  "pearson_correlation": 0.7144345080641217
+}
+// 样本不足 5 或存在常值序列：
+// {"item_id":"ITEM-002","sample_count":3,"correct_rate":1.0,"pearson_correlation":null}
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -268,6 +312,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/health` | 健康检查、题库题量 |
 | GET  | `/api/items` | 题库列表（含曝光次数，分页 `limit/offset`） |
 | GET  | `/api/items/{item_id}` | 单题详情（管理用，含正确答案） |
+| GET  | `/api/items/{item_id}/analysis` | **单题质量复盘**（已结束会话样本、历史正确率、与同场表现的 Pearson 相关系数；只读） |
 | POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数） |
 | POST | `/api/sessions` | 创建测验会话 |
 | GET  | `/api/sessions/{id}` | 会话状态 |
@@ -422,6 +467,13 @@ curl -s http://localhost:8000/api/sessions/$SID/responses
 `time_expired` / `tag_minimums_unfulfillable` / `precision_reached`）。
 其中 `precision_reached` 仅在启用了精度停测的会话上出现，且只由一次**新的**
 成功作答在同一事务内触发；答满 `max_items` 与到期停测的优先级高于精度停测。
+
+# 7) 单题质量复盘（只读；只统计已结束会话，使用作答时保存的 score）
+curl -s http://localhost:8000/api/items/ITEM-001/analysis
+# {"item_id":"ITEM-001","sample_count":12,"correct_rate":0.6667,
+#  "pearson_correlation":0.7144}
+# 样本少于 5 或任一序列无方差 -> "pearson_correlation":null
+# 未知题目 -> HTTP 404 {"detail":"item not found"}
 
 ## 环境变量
 

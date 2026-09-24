@@ -43,11 +43,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from . import irt
+from .analysis import analyze_item
 from .database import get_db, init_db
 from .importer import NormalizedItem, RowError, validate_rows
 from .models import (
     BankItemOut,
     HealthOut,
+    ItemAnalysisOut,
     ItemBankOut,
     ItemDetailOut,
     ItemImportErrorOut,
@@ -73,7 +75,7 @@ app = FastAPI(
         "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制；"
         "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -436,6 +438,38 @@ def get_item(
     base = serialize_bank_item(row).model_dump()
     base["options"] = parse_options(row["options"])
     return ItemDetailOut(**base)
+
+
+@app.get(
+    "/api/items/{item_id}/analysis",
+    response_model=ItemAnalysisOut,
+    tags=["items"],
+)
+def item_analysis(
+    item_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ItemAnalysisOut:
+    """Review one item against the answers saved by finished sessions.
+
+    Strictly read-only: no session, exposure or bank row is touched.  Each
+    finished session that answered the item *and* at least one other item
+    contributes one sample of (target score, ratio of correct peer items);
+    both numbers use the ``score`` frozen at answer time, so later bank
+    edits (including a changed correct answer) cannot change the result.
+    Returns ``pearson_correlation = null`` when fewer than 5 samples exist or
+    either series has zero variance, and 404 when the item is unknown.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    result = analyze_item(conn, item_id)
+    return ItemAnalysisOut(
+        item_id=item_id,
+        sample_count=result.sample_count,
+        correct_rate=result.correct_rate,
+        pearson_correlation=result.pearson_r,
+    )
 
 
 # -------------------------------------------------------------------------

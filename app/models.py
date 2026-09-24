@@ -52,6 +52,33 @@ class ItemBankOut(BaseModel):
     items: list[BankItemOut]
 
 
+class ItemAnalysisOut(BaseModel):
+    """Post-hoc quality review of one item, computed from finished sessions."""
+
+    item_id: str = Field(..., description="被复盘的题目 ID")
+    sample_count: int = Field(
+        ...,
+        description=(
+            "有效样本数：已结束（finished）会话中，答过该题且同场至少另答"
+            "一题的会话数量"
+        ),
+    )
+    correct_rate: float | None = Field(
+        None,
+        description=(
+            "该题在有效样本中的历史正确率（分子为作答时保存的 score 之和）；"
+            "无有效样本时为 null"
+        ),
+    )
+    pearson_correlation: float | None = Field(
+        None,
+        description=(
+            "目标题得分（0/1）与同场其余题答对比例的 Pearson 相关系数；"
+            "样本少于 5 或任一序列无方差（相关系数未定义）时为 null"
+        ),
+    )
+
+
 # ---- item bulk import ------------------------------------------------------
 
 class ItemImportRequest(BaseModel):
